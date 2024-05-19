@@ -1,7 +1,8 @@
 CC = gcc
 
 INCLUDES = -I/usr/local/include
-LIBS = -L/usr/local/lib -lsodium -lbsd -lncurses -lm
+#LIBS = -L/usr/local/lib -lsodium -lbsd -lncurses -lm
+LIBS = -L/usr/local/lib -lsodium -lbsd -lm
 
 CFLAGS = -std=gnu99 -g -Og -Wall $(INCLUDES)
 LDFLAGS = $(LIBS)

@@ -3,19 +3,27 @@
 #include <stdio.h>
 #include <stddef.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
 
 #define MAX_DATA_LENGTH 2048
+#define MAX_N_PASSWORDS 512
 
-struct DatabaseEntry {
-    char data[MAX_DATA_LENGTH];
-    size_t data_len;
-    char nonce[crypto_stream_xchacha20_NONCEBYTES];
-    char salt[crypto_pwhash_SALTBYTES];
-};
+typedef struct {
+    char platform[MAX_DATA_LENGTH];
+    char username[MAX_DATA_LENGTH];
+    char password[MAX_DATA_LENGTH];
+    size_t platform_len;
+    size_t username_len;
+    size_t password_len;
+} DBEntry;
 
-struct PwdHashEntry {
-    char hash[crypto_generichash_BYTES];
-};
+typedef struct {
+    int n_entries;
+    unsigned char nonce[crypto_stream_xchacha20_NONCEBYTES];
+    unsigned char salt[crypto_pwhash_SALTBYTES];
+    unsigned char pwdhash[crypto_generichash_BYTES];
+} DBMetadata;
 
 volatile void *sec_memcpy(volatile void *dst, volatile void *src, size_t len) {
     volatile char *cdst, *csrc;
@@ -80,7 +88,7 @@ int get_charset_size(const char *password) {
         } else if (allowed_special_char(password[i])) {
             has_special = allowed_special_char(password[i]);
         } else {
-            return NULL;
+            return -1;
         }
     }
 
@@ -88,11 +96,11 @@ int get_charset_size(const char *password) {
 }
 
 int password_correct_format(const char *password) {
-    return (get_charset_size(password) != NULL);
+    return (get_charset_size(password) != -1);
 }
 
 char *read_message(void) {
-    size_t buffer_size = 1024;
+    size_t buffer_size = MAX_DATA_LENGTH;
     char *buffer = (char *)sodium_malloc(buffer_size);
     if (buffer == NULL) {
         fprintf(stderr, "Memory allocation failed\n");
@@ -106,8 +114,8 @@ char *read_message(void) {
     }
 
     size_t length = strlen(buffer);
-    if (length > 0 && buffer[length-1] == '\n') {
-        buffer[length-1] = '\0';
+    if (length > 0 && buffer[length - 1] == '\n') {
+        buffer[length - 1] = '\0';
     }
 
     return buffer;
@@ -138,165 +146,322 @@ char *read_password(void) {
     return passbuf;
 }
 
-void encrypt(char *data, const char *key, const char *nonce, size_t data_len) {
-    crypto_stream_xchacha20_xor(data, data, data_len, nonce, key);
-}
-
-void decrypt(char *data, const char *key, const char *nonce, size_t data_len) {
-    crypto_stream_xchacha20_xor(data, data, MAX_DATA_LENGTH, nonce, key);
-}
-
-void derive_key(const char *master_password, const char *salt, char *key) {
-    // TODO: handle possible errors here.
-    crypto_pwhash(key, crypto_stream_xchacha20_KEYBYTES, master_password, strlen(master_password), salt, crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE, crypto_pwhash_ALG_DEFAULT);
-}
-
-void write_entry_to_file(const struct DatabaseEntry* file_data, const char *directory, const char *filename) {
-    char filepath[256];
-    snprintf(filepath, 256, "%s/%s", directory, filename);
-
-    FILE *file = fopen(filepath, "wb");
-    if (file == NULL) {
-        printf("Error opening file %s.\n", filepath);
-        return;
-    }
-    fwrite(file_data, sizeof(struct DatabaseEntry), 1, file);
-
-    fclose(file);
-}
-
-void read_entry_from_file(struct DatabaseEntry* file_data, const char *file_path) {
-    FILE *file = fopen(file_path, "rb");
-    if (file == NULL) {
-        printf("Error opening file %s.\n", file_path);
-        return;
+int derive_key(const char *master_password, unsigned char *salt, unsigned char *key) {
+    if (crypto_pwhash(key, crypto_stream_xchacha20_KEYBYTES, master_password, strlen(master_password), salt, crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE, crypto_pwhash_ALG_DEFAULT) != 0) {
+        return -1;
     }
 
-    fread(file_data, sizeof(struct DatabaseEntry), 1, file);
-
-    fclose(file);
+    return 0;
 }
 
-void create_pwdhash(const char *master_password, const char *directory) {
-    // create a hash of the master password and compare with a hash in passwdhash file
-    unsigned char *hash = sodium_allocarray(crypto_generichash_BYTES, sizeof(unsigned char));
-    crypto_generichash(hash, crypto_generichash_BYTES, master_password, strlen((char *)master_password), NULL, 0);
+int write_db(const char *master_password, const char *db_id, DBEntry *pdb_entries, int n_entries) {
+    size_t file_path_max_len = 256;
+    char file_path[file_path_max_len];
+    snprintf(file_path, file_path_max_len, "./%s.pdb", db_id);
 
-    char filepath[256];
-    snprintf(filepath, 256, "%s/%s", directory, "pwdhash");
-
-    FILE *file = fopen(filepath, "wb");
-    if (file == NULL) {
-        printf("Error opening file %s.\n", filepath);
-        return;
-    }
-    fwrite(hash, sizeof(char), crypto_generichash_BYTES, file);
-    fclose(file);
-
-    sodium_free(hash);
-}
-
-int verify_pwdhash(const char *master_password, const char *directory) {
-    unsigned char *hash = sodium_allocarray(crypto_generichash_BYTES, sizeof(unsigned char));
-    crypto_generichash(hash, crypto_generichash_BYTES, master_password, strlen((char *)master_password), NULL, 0);
-
-    char filepath[256];
-    snprintf(filepath, 256, "%s/%s", directory, "pwdhash");
-
-    FILE *file = fopen(filepath, "rb");
-    if (file == NULL) {
-        printf("Error opening file %s.\n", file);
-        return;
+    if (remove(file_path) != 0) {
+        switch (errno) {
+        case ENOENT:
+            // File did not exist in the first place
+            printf("Overwriting file %s\n", file_path);
+            break;
+        case EACCES:
+            // Permission denied
+            fprintf(stderr, "Error writing to file %s: permission denied.\n", file_path);
+            return -1;
+        case EBUSY:
+            // File currently in use
+            fprintf(stderr, "Error writing to file %s: file currently in use.\n", file_path);
+            return -1;
+        default:
+            // Unknown error
+            fprintf(stderr, "Error writing to file %s, ERRNO: %d\n", file_path, errno);
+            return -1;
+        }
     }
 
-    unsigned char *read_hash = sodium_allocarray(crypto_generichash_BYTES, sizeof(unsigned char));
-    fread(read_hash, sizeof(char), crypto_generichash_BYTES, file);
-    int cmp = sodium_memcmp(hash, read_hash, crypto_generichash_BYTES);
-
-    if (cmp >= 0) {
-        // hashes are the same
-        // make sure to memfree etc.
-        
-    }
-}
-
-void create_entry(const char *master_password) {
-    // Read entry data
-    char *data = read_message();
-    size_t data_len = strlen(data);
-
-    // PBKDF
-    unsigned char *salt = sodium_allocarray(crypto_pwhash_SALTBYTES, sizeof(unsigned char));
+    DBMetadata *pdb_metadata = (DBMetadata *)malloc(sizeof(DBMetadata));
+    unsigned char salt[crypto_pwhash_SALTBYTES];
     randombytes_buf(salt, sizeof salt);
-
-    unsigned char *key = sodium_allocarray(crypto_stream_xchacha20_KEYBYTES, sizeof(unsigned char));
-    derive_key(master_password, salt, key);
-
-    // Encrypt data
-    unsigned char *nonce = sodium_allocarray(crypto_stream_xchacha20_NONCEBYTES, sizeof(unsigned char));
+    unsigned char nonce[crypto_stream_xchacha20_NONCEBYTES];
     randombytes_buf(nonce, sizeof nonce);
-    encrypt(data, key, nonce, data_len);
+    unsigned char *key = sodium_allocarray(crypto_stream_xchacha20_KEYBYTES, sizeof(unsigned char));
+    if (derive_key(master_password, salt, key) != 0) {
+        fprintf(stderr, "Error occurred in generating secret key from password: %s\n", strerror(errno));
+        sodium_free(key);
+        free(pdb_metadata);
+        return -1;
+    }
 
-    struct DatabaseEntry entry;
-    sec_memcpy(entry.data, data, data_len);
-    sec_memcpy(entry.nonce, nonce, crypto_stream_xchacha20_NONCEBYTES);
-    sec_memcpy(entry.salt, salt, crypto_pwhash_SALTBYTES);
-    entry.data_len = data_len;
+    /*
+        Hash of master password for verification
+    */
+    unsigned char hash[crypto_generichash_BYTES];
+    crypto_generichash(hash, sizeof hash, (unsigned char *)master_password, strlen(master_password), NULL, 0);
 
-    // Compute short hash for file name
-    unsigned char *hash = sodium_allocarray(crypto_shorthash_BYTES, sizeof(unsigned char));
-    const unsigned char *hash_key = sodium_allocarray(16, sizeof(unsigned char));
-    crypto_shorthash_keygen(hash_key);
-    crypto_shorthash(hash, data, data_len, hash_key);
+    /*
+        Copy salt, nonce and hash of master password to
+    */
+    memcpy(pdb_metadata->salt, salt, crypto_pwhash_SALTBYTES);
+    memcpy(pdb_metadata->nonce, nonce, crypto_stream_xchacha20_NONCEBYTES);
+    memcpy(pdb_metadata->pwdhash, hash, crypto_generichash_BYTES);
+    pdb_metadata->n_entries = n_entries;
 
-    unsigned char *hash_hex = sodium_allocarray((crypto_shorthash_BYTES * 2) + 1, sizeof(unsigned char));
-    sodium_bin2hex(hash_hex, ((crypto_shorthash_BYTES * 2) + 1), hash, crypto_shorthash_BYTES);
+    size_t out_size = MAX_N_PASSWORDS * sizeof(DBEntry);
+    unsigned char *ciphertext = (unsigned char *)malloc(out_size);
+    if (pdb_entries != NULL) {
+        if (crypto_stream_xchacha20_xor(ciphertext, (unsigned char *)pdb_entries, out_size, nonce, key) != 0) {
+            sodium_free(key);
+            free(ciphertext);
+            free(pdb_metadata);
+            fprintf(stderr, "Error in encryption\n");
+            return -1;
+        }
+    }
 
-    // Write
-    write_entry_to_file(&entry, "./pwd", hash_hex);
+    FILE *file = fopen(file_path, "wb");
+    if (!file) {
+        sodium_free(key);
+        free(ciphertext);
+        free(pdb_metadata);
+        fprintf(stderr, "Error opening file %s for writing: %s\n", file_path, strerror(errno));
+    }
 
-    //sodium_memzero(key, crypto_stream_xchacha20_KEYBYTES);
-    // sodium_memzero(data, data_len);
-    // sodium_memzero(salt, crypto_pwhash_SALTBYTES);
-    // sodium_memzero(nonce, crypto_stream_xchacha20_NONCEBYTES);
-    // sodium_memzero(hash_key, 16 * sizeof(unsigned char));
-    // sodium_memzero(hash, crypto_shorthash_BYTES);
-    // sodium_memzero(hash_hex, ((crypto_shorthash_BYTES * 2) + 1));
+    /*
+        Write metadata to file
+    */
+    size_t written = fwrite(pdb_metadata, 1, sizeof(DBMetadata), file);
+    if (written != sizeof(DBMetadata)) {
+        sodium_free(key);
+        free(ciphertext);
+        free(pdb_metadata);
+        fprintf(stderr, "Error writing metadata to file %s\n", file_path);
+        return -1;
+    }
+
+    /*
+        Write encrypted database entries as a char array to file
+    */
+    if (pdb_entries != NULL) {
+        written = fwrite(ciphertext, 1, out_size, file);
+        if (written != out_size) {
+            sodium_free(key);
+            free(ciphertext);
+            free(pdb_metadata);
+            fprintf(stderr, "Error writing encrypted data to file%s\n", file_path);
+            return -1;
+        }
+    }
+    fclose(file);
     sodium_free(key);
-    sodium_free(data);
-    sodium_free(salt);
-    sodium_free(nonce);
-    sodium_free(hash);
-    sodium_free(hash_key);
-    sodium_free(hash_hex);
+    free(ciphertext);
+    free(pdb_metadata);
+    return 0;
 }
 
-void read_entry(const char *master_password, const char *file_path) {
-    struct DatabaseEntry file_data;
-    read_entry_from_file(&file_data, file_path);
+int verify_password(const char *master_password, const DBMetadata *metadata) {
+    unsigned char hash[crypto_generichash_BYTES];
+    crypto_generichash(hash, crypto_generichash_BYTES, (unsigned char *)master_password, strlen(master_password), NULL, 0);
 
-    // PBKDF
-    unsigned char *key = sodium_allocarray(crypto_stream_xchacha20_KEYBYTES, sizeof(unsigned char));
-    derive_key(master_password, file_data.salt, key);
+    return memcmp(metadata->pwdhash, hash, crypto_generichash_BYTES);
+}
 
-    // Decrypt data
-    decrypt(file_data.data, key, file_data.nonce, file_data.data_len);
-    file_data.data[file_data.data_len] = '\0';
-    printf("Output: %s\n", file_data.data);
-    sodium_memzero(&file_data.data, file_data.data_len);
-    sodium_memzero(&file_data.data_len, sizeof(size_t));
-    sodium_memzero(&file_data.nonce, crypto_stream_xchacha20_NONCEBYTES);
-    sodium_memzero(&file_data.salt, crypto_pwhash_SALTBYTES);
+int read_db(const char *master_password, const char *db_id, DBEntry *entries, DBMetadata *metadata) {
+    char file_path[256];
+    snprintf(file_path, sizeof(file_path), "./%s.pdb", db_id);
+
+    FILE *file = fopen(file_path, "rb");
+    if (!file) {
+        fprintf(stderr, "Error opening file %s for reading: %s\n", file_path, strerror(errno));
+        return -1;
+    }
+
+    if (fread(metadata, 1, sizeof(DBMetadata), file) != sizeof(DBMetadata)) {
+        fprintf(stderr, "Error reading metadata from file %s\n", file_path);
+        fclose(file);
+        return -1;
+    }
+
+    if (metadata->n_entries > 0) {
+        // Compare password hashes
+        if (verify_password(master_password, metadata) != 0) {
+            printf("Error reading DB %s: incorrect master password.\n", db_id);
+            fclose(file);
+            return -1;
+        }
+
+        unsigned char *key = sodium_allocarray(crypto_stream_xchacha20_KEYBYTES, sizeof(unsigned char));
+        if (derive_key(master_password, metadata->salt, key) != 0) {
+            fprintf(stderr, "Error occurred in generating secret key from password: %s\n", strerror(errno));
+            sodium_free(key);
+            fclose(file);
+            return -1;
+        }
+        unsigned char *data = (unsigned char *)sodium_malloc(MAX_N_PASSWORDS * sizeof(DBEntry));
+        if (fread(data, 1, MAX_N_PASSWORDS * sizeof(DBEntry), file) != (MAX_N_PASSWORDS * sizeof(DBEntry))) {
+            fprintf(stderr, "Error reading encrypted data from file%s\n", file_path);
+            fclose(file);
+            sodium_free(key);
+            free(data);
+            return -1;
+        }
+
+        if (crypto_stream_xchacha20_xor(data, data, MAX_N_PASSWORDS * sizeof(DBEntry), metadata->nonce, key) != 0) {
+            fprintf(stderr, "Error in decryption\n");
+            sodium_free(key);
+            free(data);
+            return -1;
+        }
+        sec_memcpy(entries, (DBEntry *)data, MAX_N_PASSWORDS * sizeof(DBEntry));
+
+        for (int i = 0; i < metadata->n_entries; i++) {
+            // I am not sure why the null terminator seemingly disappears in the encryption/decryption process
+            // This adds it back
+            entries[i].platform[entries[i].platform_len] = '\0';
+            entries[i].username[entries[i].username_len] = '\0';
+            entries[i].password[entries[i].password_len] = '\0';
+        }
+
+        sodium_free(key);
+        sodium_free(data);
+    }
+
+    fclose(file);
+    return 0;
+}
+
+
+void create_entry(const char *master_password, DBEntry *entries, DBMetadata *metadata, char *platform, char *username, char *password) {
+    if (metadata->n_entries >= MAX_N_PASSWORDS) {
+        fprintf(stderr, "Cannot create new entry: maximum number of passwords reached.");
+        return;
+    }
+
+    DBEntry new_entry;
+    sec_memcpy(new_entry.username, username, strlen(username));
+    sec_memcpy(new_entry.password, password, strlen(password));
+    sec_memcpy(new_entry.platform, platform, strlen(platform));
+    new_entry.username_len = strlen(username);
+    new_entry.password_len = strlen(password);
+    new_entry.platform_len = strlen(platform);
+
+    entries[metadata->n_entries] = new_entry;
+    metadata->n_entries++;
+}
+
+int create_entry_prompt(const char *master_password, const char *db_id) {
+    DBEntry *entries = (DBEntry *)sodium_malloc(MAX_N_PASSWORDS * sizeof(DBEntry));
+    DBMetadata metadata;
+    if (read_db(master_password, db_id, entries, &metadata) != 0) {
+        sodium_free(entries);
+        return -1;
+    }
+
+    printf("Enter a platform: ");
+    char *platform = read_message();
+    printf("\nEnter a username: ");
+    char *username = read_message();
+    printf("\nEnter a password: ");
+    char *password = read_password();
+
+    if (platform == NULL || username == NULL || password == NULL) {
+        sodium_free(password);
+        sodium_free(username);
+        sodium_free(platform);
+        sodium_free(entries);
+        return -1;
+    }
+
+    create_entry(master_password, entries, &metadata, platform, username, password);
+
+    int return_val;
+    if (write_db(master_password, db_id, entries, metadata.n_entries) != 0) {
+        return_val = -1;
+    } else {
+        return_val = 0;
+    }
+
+    sodium_free(entries);
+    sodium_free(password);
+    sodium_free(username);
+    sodium_free(platform);
+    return return_val;
+}
+
+int read_entries(const char *master_password, const char *db_id) {
+    DBEntry *entries = (DBEntry *)sodium_malloc(MAX_N_PASSWORDS * sizeof(DBEntry));
+    DBMetadata metadata;
+    read_db(master_password, db_id, entries, &metadata);
+    if (verify_password(master_password, &metadata) != 0) {
+        fprintf(stderr, "Error reading DB %s: incorrect master password.\n", db_id);
+        sodium_free(entries);
+        return -1;
+    }
+
+    int n_entries = metadata.n_entries;
+    for (int i = 0; i < n_entries; i++) {
+        printf("-------\nEntry %s\n-------\n", entries[i].platform);
+        printf("Username: %s\n", entries[i].username);
+        printf("Password: %s\n", entries[i].password);
+        printf("-------\n");
+    }
+
+    sodium_free(entries);
+    return 0;
 }
 
 int main() {
     if (sodium_init() < 0) {
+        return 1;
     }
-    char *master_password = read_password();
-    // assume user wants to create an entry for now
-    // create_entry(master_password);
-    read_entry(master_password, "./pwd/f7dbb7558d80f129");
 
-    sodium_memzero(master_password, strlen(master_password));
+    printf("Enter a DB name: ");
+    char *db_id = read_message();
+    char db[MAX_DATA_LENGTH];
+    snprintf(db, MAX_DATA_LENGTH, "%s.pdb", db_id);
+    char *master_password = read_password();
+    if (access(db, F_OK) != -1) {
+        // File already exists
+        printf("Accessing password DB %s.\n", db_id);
+    } else {
+        // File does not already exist 
+        printf("Password DB %s does not exist or cannot be accessed. Attempting to create a new DB with this name...\n", db_id);
+        if (write_db(master_password, db_id, NULL, 0) != 0) {
+            sodium_free(master_password);
+            sodium_free(db_id);
+            return 1;
+        }
+        printf("DB %s created.\n", db_id);
+    }
+
+    while (1) {
+        printf("Welcome to Daniel's password manager CLI. You are currently accessing the database:\n%s\n", db_id);
+        printf("Press 1 to read the database entries. Press 2 to create a new entry. Press 3 to exit.\nInput: ");
+        char *input = read_message();
+        if (strcmp(input, "1") == 0) {
+            printf("Reading entries:\n");
+            if (read_entries(master_password, db_id) != 0) {
+                sodium_free(master_password);
+                sodium_free(input);
+                sodium_free(db_id);
+                return 1;
+            }
+        } else if (strcmp(input, "2") == 0) {
+            printf("Create an entry:\n");
+            if (create_entry_prompt(master_password, db_id) != 0) {
+                sodium_free(master_password);
+                sodium_free(input);
+                sodium_free(db_id);
+                return 1;
+            }
+        } else {
+            printf("Goodbye.\n");
+            sodium_free(input);
+            break;
+        }
+    }
+
     sodium_free(master_password);
+    sodium_free(db_id);
+    return 0;
 }
