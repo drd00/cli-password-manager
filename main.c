@@ -302,14 +302,14 @@ int read_db(const char *master_password, const char *db_id, DBEntry *entries, DB
             fprintf(stderr, "Error reading encrypted data from file%s\n", file_path);
             fclose(file);
             sodium_free(key);
-            free(data);
+            sodium_free(data);
             return -1;
         }
 
         if (crypto_stream_xchacha20_xor(data, data, MAX_N_PASSWORDS * sizeof(DBEntry), metadata->nonce, key) != 0) {
             fprintf(stderr, "Error in decryption\n");
             sodium_free(key);
-            free(data);
+            sodium_free(data);
             return -1;
         }
         sec_memcpy(entries, (DBEntry *)data, MAX_N_PASSWORDS * sizeof(DBEntry));
