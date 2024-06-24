@@ -5,3 +5,8 @@ Cryptographic functions are provided by **libsodium**. The rest of program aims 
 That said, this is my first project using C (I had a lot of fun!), so I would **not** recommend using this seriously.
 
 I intend to provide a CLI using ncurses, but this is a kind of minimal working version with a less visually appealing user interface.
+
+## Installation
+`make`. Requires `libbsd-dev` and `libsodium-dev` (e.g., from Ubuntu's repositories).
+
+May provide a binary in the future.
